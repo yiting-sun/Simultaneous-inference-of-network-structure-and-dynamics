@@ -9,7 +9,7 @@ The training process are saved in path './Training_process/recorded_models.pt' a
 ======================================
 
 We prepare another file Simultaneous_Inference_HR_general_model.ipynb for revised model 'Get_sign_MP' in model.py.
-Before running this program, you should run the program for saving the recorded edge weights and elementary trained modules.
+Before running this program, you should run the program train_sign_HR_general_model.py. for saving the recorded edge weights and elementary trained modules.
 
 Run Simultaneous_Inference_HR_general_model.ipynb.
 Use the classified sign edge and edge type to train modules precisely to get more accurate module results.
