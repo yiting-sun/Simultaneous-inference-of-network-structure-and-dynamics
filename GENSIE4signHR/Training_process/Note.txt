@@ -1,0 +1,5 @@
+The final results on the main paper is drawn by 'recorded modeld i2j'
+The other chechpoints are the debugging and paramter adjusting tests:
+'lamNone' is setting square=false and lam = None
+'lam1e-8' is setting square=True and lam = 1e-8
+'lam0.0001' is setting square=False and lam = 0.0001, this result is bettter, showing balanced parameters.
