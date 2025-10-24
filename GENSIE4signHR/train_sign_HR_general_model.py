@@ -104,6 +104,7 @@ structure_weights = []
 
 os.makedirs('Training_process', exist_ok=True)
 save_path = f'Training_process/'
+save_interval = 100
 
 for epoch in range(total_epochs):
     show_progress = (epoch + 1) % 20 == 0 or epoch == 0
@@ -146,6 +147,10 @@ for epoch in range(total_epochs):
         cur_weights = Dyn.weights.cpu().detach().numpy()
         structure_weights.append(cur_weights)
 
+    if epoch % save_interval == 0:
+        recorded_models.append(copy(Dyn.state_dict()))
+
+if (total_epochs - 1) % save_interval != 0:
     recorded_models.append(copy(Dyn.state_dict()))
 
 # save model and weights
