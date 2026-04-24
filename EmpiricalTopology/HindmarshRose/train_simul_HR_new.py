@@ -432,18 +432,8 @@ def main():
             with open(data_path + f'metrics_snapshot_e{epoch+1}.json', 'w') as f:
                 json.dump(snap, f, indent=2, default=float)
 
-            with open(data_path + f'weights_over_time_lam{args.lam}_e{epoch}.pkl', 'wb') as f:
-                pickle.dump(structure_weights, f)
-
-            Eva = pd.DataFrame({'AUC': AUC_over_time, 'AUPRC': AUPRC_over_time})
-            Eva.to_csv(data_path + f'Eva_lam{args.lam}_e{epoch}.csv')
-
             torch.save(copy.deepcopy(_unwrap(Dyn).state_dict()),
                        data_path + f'recorded_model_e{epoch+1}.pt')
-
-            structure_weights = []
-            AUC_over_time = []
-            AUPRC_over_time = []
 
     elapsed = time.time() - start_time
     print(f'\nTraining done in {elapsed:.1f}s')
