@@ -1,0 +1,53 @@
+{
+  "source_article": "https://elifesciences.org/articles/16962",
+  "source_matrix_file": "elife-16962-fig16-data1-v1.xlsx",
+  "matrix_semantics": "A[i,j] = 1 means a directed edge j -> i",
+  "raw_matrix_semantics": "Workbook rows are presynaptic cells and columns are postsynaptic partners",
+  "node_count": 177,
+  "edge_count": 2554,
+  "density": 0.08152191260493473,
+  "self_loops_in_saved_adjacency": 0,
+  "self_loops_removed_from_raw": 17,
+  "excluded_non_cns_presynaptic_labels": [
+    "ATEN1",
+    "ATEN2",
+    "ATEN3",
+    "ATEN4",
+    "BTN1",
+    "BTN2",
+    "BTN3",
+    "BTN4",
+    "lens6",
+    "pna",
+    "pnb",
+    "pnc",
+    "pnf",
+    "pnh",
+    "pns1",
+    "pns10",
+    "pns11",
+    "pns12",
+    "pns13",
+    "pns3",
+    "pns4",
+    "pns5",
+    "pns6",
+    "pns7",
+    "pns9",
+    "pnu",
+    "pnw",
+    "pnx"
+  ],
+  "postsynaptic_column_remap": {
+    "19": "5",
+    "40": "35",
+    "44": "57",
+    "coronet10": "coronet14",
+    "coronet5": "coronet2"
+  },
+  "output_files": {
+    "npy": "ciona_cns_177_binary_adj.npy",
+    "csv": "ciona_cns_177_binary_adj.csv",
+    "labels": "ciona_cns_177_labels.txt"
+  }
+}
