@@ -1,0 +1,39 @@
+{
+  "run_name": "run30_rate_x_lam0.001_nozscore_gaussian_tau0.99_n46",
+  "msg_config": "rate_x",
+  "num_nodes_keep": 10,
+  "num_train_samples": 46,
+  "total_samples": 460,
+  "epochs_run": 311,
+  "early_stopped": true,
+  "best_val_mse": 59.598228309029025,
+  "train": {
+    "mse": 17.1741565828738,
+    "r2": 0.8553697168827057,
+    "node_r2_mean": 0.800883062928915
+  },
+  "val": {
+    "mse": 66.40530480836567,
+    "r2": 0.7740102559328079,
+    "node_r2_mean": 0.7555813908576965
+  },
+  "test": {
+    "mse": 103.81438539404618,
+    "r2": 0.722960501909256,
+    "node_r2_mean": 0.6820182934403419
+  },
+  "structure": {
+    "auc": 0.5900000000000001,
+    "auprc": 0.14002167183475095,
+    "corr": 0.05379414953727907,
+    "mse": 0.2761781187919658,
+    "mae": 0.3413170521162101
+  },
+  "config": {
+    "lam": 0.001,
+    "tau": 1.0,
+    "seed": 30,
+    "zscore": false,
+    "smoothing": null
+  }
+}

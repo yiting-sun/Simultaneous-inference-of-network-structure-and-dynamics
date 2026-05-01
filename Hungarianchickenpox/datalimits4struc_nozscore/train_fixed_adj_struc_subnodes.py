@@ -1,0 +1,573 @@
+"""
+Training Script (Step 1): Fixed Adjacency + Msg-Feature Ablation + Sub-Nodes
+============================================================================
+Adapted from
+``datalimits4dyn_nozscore/train_fixed_adj_ablation_msg_subnodes.py``
+with two changes:
+
+1. **No uniform subsampling.** The full 60% training split is always used
+   (the ``--num_train_samples`` knob is removed). The user requested using
+   "all training data (60% of all data), no uniform sampling".
+
+2. **Adjacency npz files are loaded from the sibling ``datalimits4dyn_nozscore``
+   directory** (where they live), instead of from the local dir.
+
+The script keeps the sub-node knob (``--num_nodes_keep``) and the
+seed-deterministic node-dropping logic. The trained model is saved to
+``best_model.pt`` so its ``msg_fnc`` and ``node_fnc_self`` MLP weights can be
+used as the *known* self / message functions in Step 2.
+"""
+
+import os, sys, argparse, time, math, pickle, json
+import numpy as np
+import pandas as pd
+import torch
+from torch.utils.data import Dataset
+from torch_geometric.data import Data
+from torch_geometric.loader import DataLoader
+from torch.optim.lr_scheduler import OneCycleLR
+from scipy.ndimage import gaussian_filter1d
+from statsmodels.tsa.seasonal import seasonal_decompose
+from tqdm import tqdm
+
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+SEASONAL_DIR = os.path.dirname(CURRENT_DIR)
+PROJECT_DIR = SEASONAL_DIR
+if CURRENT_DIR not in sys.path:
+    sys.path.insert(0, CURRENT_DIR)
+
+from model_fixed_adj_struc import (
+    GraphDerivNNFixedAdjMsgAblation,
+    build_fully_connected_edge_index,
+    count_parameters,
+    MSG_CONFIGS,
+    FEATURE_NAMES_MAP,
+    describe_msg_config,
+)
+
+
+SUPPORTED_MSG_CONFIGS = ("rate_x",)
+# Shared surrogate adjacency lives at the project root.
+FIXED_ADJ_NPZ_MAP = {
+    "runs3thr0p6": os.path.join(PROJECT_DIR, "surrogateAdj_shared_edge_masks_runs3_thr0p6.npz"),
+}
+
+ORIGINAL_NUM_NODES = 20  # chickenpox Hungary has 20 counties
+
+
+class WeightedGraphDataset(Dataset):
+    def __init__(self, X, Y, edge_index):
+        self.X, self.Y, self.edge_index = X, Y, edge_index
+    def __len__(self):
+        return self.X.shape[0]
+    def __getitem__(self, idx):
+        return Data(x=self.X[idx], y=self.Y[idx], edge_index=self.edge_index)
+
+
+# ----------------------------- features --------------------------------
+
+def rolling_mean_prefix(X, window):
+    out = np.zeros_like(X)
+    csum = np.cumsum(X, axis=0)
+    for t in range(X.shape[0]):
+        start = max(0, t - window + 1)
+        total = csum[t] - (csum[start - 1] if start > 0 else 0.0)
+        out[t] = total / float(t - start + 1)
+    return out
+
+def lagged_difference(X, lag):
+    out = np.zeros_like(X)
+    for t in range(X.shape[0]):
+        prev_idx = max(0, t - lag)
+        out[t] = X[prev_idx] - X[t]
+    return out
+
+def compute_seasonal_components(X, period):
+    seasonal = np.zeros_like(X, dtype=np.float32)
+    for i in range(X.shape[1]):
+        result = seasonal_decompose(X[:, i], model="additive", period=period, extrapolate_trend="freq")
+        seasonal[:, i] = result.seasonal.astype(np.float32)
+    return seasonal
+
+def build_longwindow_features_t(X, dt=1.0, seasonal_period=52):
+    ma3  = rolling_mean_prefix(X, 3)
+    ma5  = rolling_mean_prefix(X, 5)
+    ma10 = rolling_mean_prefix(X, 10)
+    diff3 = lagged_difference(X, 3)
+    seasonal = compute_seasonal_components(X, period=seasonal_period)
+    valid_t = np.arange(11, X.shape[0] - 1, dtype=np.int64)
+
+    features = np.concatenate([
+        X[valid_t, :, None], X[valid_t - 1, :, None],
+        ma3[valid_t, :, None], diff3[valid_t, :, None],
+        seasonal[valid_t, :, None],
+        ((seasonal[valid_t, :] - seasonal[valid_t - 11, :]) / 11.0)[:, :, None],
+        ma5[valid_t, :, None], ma10[valid_t, :, None],
+        ((X[valid_t - 5, :] - X[valid_t, :]) / 5.0)[:, :, None],
+        ((X[valid_t - 10, :] - X[valid_t, :]) / 10.0)[:, :, None],
+    ], axis=2).astype(np.float32)
+
+    dxdt = ((X[valid_t + 1, :] - X[valid_t, :]) / dt)[:, :, None].astype(np.float32)
+    feature_names = [
+        "x_t", "x_t_minus_1", "i_ma3_hist", "i_prev_diff3",
+        "i_seasonal_t", "i_seasonal_t_rate12to1",
+        "j_ma5_hist", "j_ma10_hist",
+        "j_rate5", "j_rate10",
+    ]
+    return features, dxdt, feature_names
+
+
+# ----------------------------- node selection --------------------------
+
+def select_kept_node_indices(total_nodes, num_keep, seed):
+    """Reproducibly choose ``num_keep`` node indices to RETAIN out of
+    ``total_nodes``. Uses a dedicated ``np.random.default_rng(seed)`` so the
+    choice is fully determined by ``seed`` and independent of the global
+    numpy/torch RNG state.
+    """
+    if num_keep > total_nodes:
+        raise ValueError(f"num_keep={num_keep} > total_nodes={total_nodes}")
+    if num_keep <= 0:
+        raise ValueError(f"num_keep must be positive, got {num_keep}")
+    rng = np.random.default_rng(int(seed))
+    kept = rng.choice(total_nodes, size=num_keep, replace=False)
+    return np.sort(kept).astype(np.int64)
+
+
+def identity_norm_template(X_train, y_train):
+    x_mu = torch.zeros_like(X_train[:1])
+    x_std = torch.ones_like(X_train[:1])
+    y_mu = torch.zeros_like(y_train[:1])
+    y_std = torch.ones_like(y_train[:1])
+    return x_mu, x_std, y_mu, y_std
+
+
+# ----------------------------- metrics ---------------------------------
+
+def safe_corrcoef(x, y):
+    x, y = np.asarray(x).reshape(-1), np.asarray(y).reshape(-1)
+    if x.size == 0 or np.allclose(np.std(x), 0) or np.allclose(np.std(y), 0):
+        return np.nan
+    return float(np.corrcoef(x, y)[0, 1])
+
+def compute_r2(y_true, y_pred):
+    y_true, y_pred = np.asarray(y_true).reshape(-1), np.asarray(y_pred).reshape(-1)
+    ss_res = np.sum((y_true - y_pred) ** 2)
+    ss_tot = np.sum((y_true - np.mean(y_true)) ** 2)
+    return float(1.0 - ss_res / ss_tot) if not np.allclose(ss_tot, 0) else np.nan
+
+def evaluate_on_set(model, X_set, y_set, edge_index, device):
+    model.eval()
+    preds, trues = [], []
+    edge_index_dev = edge_index.to(device)
+    with torch.no_grad():
+        for t in range(X_set.shape[0]):
+            x = X_set[t].to(device)
+            pred = model(x, edge_index=edge_index_dev)
+            preds.append(pred.cpu().numpy())
+            trues.append(y_set[t].numpy())
+    preds = np.array(preds)
+    trues = np.array(trues)
+
+    mse = float(np.mean((trues - preds) ** 2))
+    mae = float(np.mean(np.abs(trues - preds)))
+    r2 = compute_r2(trues.reshape(-1), preds.reshape(-1))
+    corr = safe_corrcoef(trues.reshape(-1), preds.reshape(-1))
+
+    n_nodes = preds.shape[1]
+    node_mse, node_r2, node_corr = [], [], []
+    for i in range(n_nodes):
+        yi, yhi = trues[:, i, 0], preds[:, i, 0]
+        node_mse.append(float(np.mean((yi - yhi) ** 2)))
+        node_r2.append(compute_r2(yi, yhi))
+        node_corr.append(safe_corrcoef(yi, yhi))
+
+    return {
+        "mse": mse, "mae": mae, "r2": r2, "corr": corr,
+        "node_mse": node_mse, "node_r2": node_r2, "node_corr": node_corr,
+        "node_r2_mean": float(np.nanmean(node_r2)),
+        "node_r2_median": float(np.nanmedian(node_r2)),
+        "node_r2_min": float(np.nanmin(node_r2)),
+        "node_r2_max": float(np.nanmax(node_r2)),
+        "node_corr_mean": float(np.nanmean(node_corr)),
+    }
+
+
+def load_shared_edge_mask_adj_full(adj_type, msg_config, expected_full_nodes):
+    """Load the FULL (20x20) adjacency before any node-dropping."""
+    npz_path = FIXED_ADJ_NPZ_MAP[adj_type]
+    if not os.path.isfile(npz_path):
+        raise FileNotFoundError(f"npz not found: {npz_path}")
+    data = np.load(npz_path, allow_pickle=True)
+    key = f"mask_{msg_config}"
+    if key not in data:
+        raise KeyError(f"{key} not found in {npz_path}")
+
+    if "msg_configs" in data:
+        saved_msg_configs = [str(x) for x in data["msg_configs"].tolist()]
+    elif "msg_config" in data:
+        raw = data["msg_config"].tolist()
+        if isinstance(raw, (list, tuple)):
+            saved_msg_configs = [str(x) for x in raw]
+        else:
+            saved_msg_configs = [str(raw)]
+    else:
+        saved_msg_configs = [msg_config]
+    if msg_config not in saved_msg_configs:
+        raise ValueError(f"msg_config={msg_config} not listed in {npz_path}: {saved_msg_configs}")
+
+    A = data[key].astype(np.float32)
+    if A.shape != (expected_full_nodes, expected_full_nodes):
+        raise ValueError(
+            f"Adjacency shape mismatch for {adj_type}/{msg_config}: "
+            f"expected {(expected_full_nodes, expected_full_nodes)}, got {A.shape}"
+        )
+    np.fill_diagonal(A, 0)
+    return A
+
+
+def str2bool(v):
+    if isinstance(v, bool):
+        return v
+    if v.lower() in {"true", "1", "yes"}:
+        return True
+    if v.lower() in {"false", "0", "no"}:
+        return False
+    raise argparse.ArgumentTypeError(f"Boolean value expected, got {v}")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Step 1: train fixed-adj msg-ablation on FULL training data, "
+                    "with sub-node selection. No uniform subsampling.")
+    parser.add_argument("--adj_type", type=str, default="runs3thr0p6",
+                        choices=list(FIXED_ADJ_NPZ_MAP.keys()))
+    parser.add_argument("--msg_config", type=str, default="rate_x",
+                        choices=list(SUPPORTED_MSG_CONFIGS))
+    parser.add_argument("--outdir", type=str, required=True)
+    parser.add_argument("--zscore", type=str2bool, default=False)
+    parser.add_argument("--smooth", type=str, default="gaussian", choices=["gaussian", "none"])
+    parser.add_argument("--device", type=str, default="cuda:1" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--epochs", type=int, default=2000)
+    parser.add_argument("--hidden", type=int, default=100)
+    parser.add_argument("--batch", type=int, default=64,
+                        help="Fallback batch size (used only when --batch_ratio <= 0).")
+    parser.add_argument("--batch_ratio", type=float, default=0.1,
+                        help="Batch size as a fraction of the (full) training set.")
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--weight_decay", type=float, default=1e-5)
+    parser.add_argument("--dropout", type=float, default=0.10)
+    parser.add_argument("--train_ratio", type=float, default=0.6)
+    parser.add_argument("--val_ratio", type=float, default=0.2)
+    parser.add_argument("--test_ratio", type=float, default=0.2)
+    parser.add_argument("--early_stop_patience", type=int, default=40)
+    parser.add_argument("--early_stop_min_delta", type=float, default=1e-4)
+    parser.add_argument("--metrics_every", type=int, default=50)
+    parser.add_argument("--seasonal_period", type=int, default=52)
+    parser.add_argument("--use_seed", type=str2bool, default=False)
+    parser.add_argument("--seed", type=int, default=2)
+    # ---- node-limits knob ---------------------------------------------------
+    parser.add_argument("--num_nodes_keep", type=int, default=20,
+                        help=f"Number of nodes to KEEP out of the full {ORIGINAL_NUM_NODES}-node "
+                             "graph. Dropped nodes are selected reproducibly from --seed.")
+    args = parser.parse_args()
+
+    os.makedirs(args.outdir, exist_ok=True)
+    if args.use_seed:
+        torch.manual_seed(args.seed)
+        np.random.seed(args.seed)
+    device = torch.device(args.device)
+
+    ts_csv = os.path.join(PROJECT_DIR, "hungary_chickenpox_reordered_trimmed.csv")
+    edge_csv = os.path.join(PROJECT_DIR, "hungary_county_edges.csv")
+    adj_npy = os.path.join(PROJECT_DIR, "hungary_chickenpox_adj.npy")
+
+    msg_config = args.msg_config
+    if args.zscore:
+        raise ValueError("This script only supports --zscore false (nozscore).")
+
+    print(f"{'=' * 60}")
+    print(f"Step1 (struc) Fixed Adj Ablation: "
+          f"adj_type={args.adj_type}, msg={msg_config}")
+    print(f"zscore={args.zscore}, smooth={args.smooth}, seed={args.seed}")
+    print(f"num_nodes_keep={args.num_nodes_keep}, FULL training data (no subsampling)")
+    print(f"Output: {args.outdir}")
+    print(f"Data sources: ts_csv={ts_csv}, edge_csv={edge_csv}, adj_npy={adj_npy}")
+    print(f"{'=' * 60}")
+
+    # Load full data
+    ts = pd.read_csv(ts_csv)
+    full_county_names = list(ts.columns[1:])
+    X_raw_full = ts.iloc[:, 1:].to_numpy(dtype=np.float32)
+    full_n = X_raw_full.shape[1]
+    if full_n != ORIGINAL_NUM_NODES:
+        print(f"WARNING: expected {ORIGINAL_NUM_NODES} columns in {ts_csv}, got {full_n}.")
+
+    # ---- node-dropping (reproducible from seed) ----------------------------
+    kept_node_indices = select_kept_node_indices(
+        total_nodes=full_n, num_keep=args.num_nodes_keep, seed=args.seed
+    )
+    dropped_node_indices = np.sort(np.array(
+        [i for i in range(full_n) if i not in set(kept_node_indices.tolist())],
+        dtype=np.int64,
+    ))
+    county_names = [full_county_names[i] for i in kept_node_indices]
+    X_raw = X_raw_full[:, kept_node_indices]
+
+    print(f"Node dropping: kept {len(kept_node_indices)}/{full_n} nodes "
+          f"(dropped {len(dropped_node_indices)})")
+    print(f"  kept_indices    = {kept_node_indices.tolist()}")
+    print(f"  dropped_indices = {dropped_node_indices.tolist()}")
+    np.save(os.path.join(args.outdir, "kept_node_indices.npy"), kept_node_indices)
+    np.save(os.path.join(args.outdir, "dropped_node_indices.npy"), dropped_node_indices)
+
+    X = gaussian_filter1d(X_raw, sigma=1.5, axis=0, mode="nearest") if args.smooth == "gaussian" else X_raw
+
+    X_feat, dXdt, feature_names = build_longwindow_features_t(X, dt=1.0, seasonal_period=args.seasonal_period)
+
+    X_t = torch.tensor(X_feat, dtype=torch.float32)
+    Y_t = torch.tensor(dXdt, dtype=torch.float32)
+    num_nodes = X_feat.shape[1]
+    assert num_nodes == args.num_nodes_keep, (num_nodes, args.num_nodes_keep)
+    T = X_t.shape[0]
+
+    # 60/20/20 temporal split
+    train_end = int(T * args.train_ratio)
+    val_end = int(T * (args.train_ratio + args.val_ratio))
+
+    X_train, Y_train = X_t[:train_end], Y_t[:train_end]
+    X_val, Y_val = X_t[train_end:val_end], Y_t[train_end:val_end]
+    X_test, Y_test = X_t[val_end:], Y_t[val_end:]
+
+    # *** No uniform subsampling: always use full training rows ***
+    train_full_size = X_train.shape[0]
+    effective_num_train = train_full_size
+
+    print(
+        f"Data split: train={X_train.shape[0]} (FULL), "
+        f"val={X_val.shape[0]}, test={X_test.shape[0]} (total feat rows={T})"
+    )
+
+    x_mu, x_std, y_mu, y_std = identity_norm_template(X_train, Y_train)
+
+    # Build fixed adjacency: load full 20x20, then drop the same rows/cols.
+    fixed_adj_full = load_shared_edge_mask_adj_full(args.adj_type, msg_config, full_n)
+    fixed_adj = fixed_adj_full[np.ix_(kept_node_indices, kept_node_indices)]
+    np.fill_diagonal(fixed_adj, 0)
+
+    np.save(os.path.join(args.outdir, "fixed_adjacency.npy"), fixed_adj)
+    np.save(os.path.join(args.outdir, "fixed_adjacency_full.npy"), fixed_adj_full)
+    n_edges_active = int((fixed_adj > 0).sum())
+    denom = max(1, num_nodes * (num_nodes - 1))
+    print(f"Adjacency: {args.adj_type}, sub-shape={fixed_adj.shape}, "
+          f"active edges={n_edges_active}, density={n_edges_active / denom:.3f}")
+
+    # Ablation config
+    msg_description = describe_msg_config(msg_config)
+    print(f"Msg config: {msg_description}")
+
+    # Build model
+    edge_index = build_fully_connected_edge_index(num_nodes)
+    fixed_adj_tensor = torch.tensor(fixed_adj, dtype=torch.float32)
+
+    model = GraphDerivNNFixedAdjMsgAblation(
+        n_f=X_train.shape[-1],
+        msg_dim=1,
+        ndim=1,
+        delt_t=1.0,
+        num_nodes=num_nodes,
+        fixed_adj=fixed_adj_tensor,
+        msg_config=msg_config,
+        hidden=args.hidden,
+        dropout=args.dropout,
+    ).to(device)
+
+    print(f"Model params: {count_parameters(model):,} (adj is fixed)")
+
+    torch.save({
+        "x_mu": x_mu.cpu(), "x_std": x_std.cpu(),
+        "y_mu": y_mu.cpu(), "y_std": y_std.cpu(),
+        "feature_names": feature_names,
+        "msg_config": msg_config,
+        "adj_type": args.adj_type,
+        "msg_description": msg_description,
+        "num_train_samples": effective_num_train,
+        "train_full_size": train_full_size,
+        "num_nodes": int(num_nodes),
+        "kept_node_indices": kept_node_indices.tolist(),
+        "dropped_node_indices": dropped_node_indices.tolist(),
+        "kept_county_names": county_names,
+    }, os.path.join(args.outdir, "norm_stats.pt"))
+
+    # DataLoaders
+    train_ds = WeightedGraphDataset(X_train, Y_train, edge_index)
+    val_ds = WeightedGraphDataset(X_val, Y_val, edge_index)
+    if args.batch_ratio is not None and args.batch_ratio > 0:
+        effective_batch = max(1, int(math.ceil(args.batch_ratio * len(train_ds))))
+    else:
+        effective_batch = max(1, args.batch)
+    print(f"Batch size: {effective_batch} (batch_ratio={args.batch_ratio}, "
+          f"train_ds_size={len(train_ds)})")
+    train_loader = DataLoader(train_ds, batch_size=effective_batch, shuffle=False)
+    val_loader = DataLoader(val_ds, batch_size=effective_batch, shuffle=False)
+
+    opt = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    steps_per_epoch = max(1, len(train_loader))
+    sched = OneCycleLR(opt, max_lr=args.lr, steps_per_epoch=steps_per_epoch,
+                       epochs=args.epochs, final_div_factor=1e4)
+
+    best_val_loss = float("inf")
+    best_state = None
+    epochs_no_improve = 0
+    train_hist, val_hist = [], []
+    metrics_rows = []
+    start = time.time()
+
+    desc = f"{args.adj_type}_{msg_config}_nN{num_nodes}_FULL"
+    for epoch in tqdm(range(args.epochs), desc=desc):
+        model.train()
+        tr_loss, tr_items = 0.0, 0
+        for g in train_loader:
+            g = g.to(device)
+            opt.zero_grad()
+            loss = model.loss(g, square=False)
+            bsz = int(getattr(g, "num_graphs", 1))
+            (loss / max(1, bsz)).backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+            opt.step()
+            sched.step()
+            tr_loss += loss.item()
+            tr_items += bsz
+        train_mse = tr_loss / max(1, tr_items)
+        train_hist.append(train_mse)
+
+        model.eval()
+        va_loss, va_items = 0.0, 0
+        with torch.no_grad():
+            for g in val_loader:
+                g = g.to(device)
+                loss = model.data_loss(g, square=False)
+                bsz = int(getattr(g, "num_graphs", 1))
+                va_loss += loss.item()
+                va_items += bsz
+        val_mse = va_loss / max(1, va_items)
+        val_hist.append(val_mse)
+
+        if val_mse < (best_val_loss - args.early_stop_min_delta):
+            best_val_loss = val_mse
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            epochs_no_improve = 0
+            torch.save({
+                "epoch": epoch + 1,
+                "state_dict": best_state,
+                "adj_type": args.adj_type,
+                "msg_config": msg_config,
+                "msg_description": msg_description,
+                "config": vars(args),
+                "train_mse": train_mse,
+                "val_mse": val_mse,
+                "num_train_samples": effective_num_train,
+                "num_nodes": int(num_nodes),
+                "kept_node_indices": kept_node_indices.tolist(),
+                "hidden": int(args.hidden),
+                "dropout": float(args.dropout),
+            }, os.path.join(args.outdir, "best_model.pt"))
+        else:
+            epochs_no_improve += 1
+
+        if args.metrics_every > 0 and ((epoch + 1) % args.metrics_every == 0 or epoch + 1 == args.epochs):
+            train_metrics = evaluate_on_set(model, X_train, Y_train, edge_index, device)
+            val_metrics = evaluate_on_set(model, X_val, Y_val, edge_index, device)
+            test_metrics = evaluate_on_set(model, X_test, Y_test, edge_index, device)
+
+            row = {
+                "epoch": epoch + 1,
+                "train_loss": train_mse, "val_loss": val_mse,
+                "train_mse": train_metrics["mse"], "train_r2": train_metrics["r2"],
+                "val_mse": val_metrics["mse"], "val_r2": val_metrics["r2"],
+                "test_mse": test_metrics["mse"], "test_mae": test_metrics["mae"],
+                "test_r2": test_metrics["r2"], "test_corr": test_metrics["corr"],
+                "test_node_r2_mean": test_metrics["node_r2_mean"],
+                "test_node_r2_median": test_metrics["node_r2_median"],
+                "test_node_r2_min": test_metrics["node_r2_min"],
+                "test_node_r2_max": test_metrics["node_r2_max"],
+            }
+            metrics_rows.append(row)
+
+            if (epoch + 1) % 100 == 0 or epoch + 1 == args.epochs:
+                print(f"  epoch={epoch+1} train_loss={train_mse:.4f} val_loss={val_mse:.4f} "
+                      f"test_R2={test_metrics['r2']:.4f} node_R2_mean={test_metrics['node_r2_mean']:.4f}")
+
+        if epochs_no_improve >= args.early_stop_patience:
+            print(f"  Early stopping at epoch {epoch + 1}")
+            break
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+
+    elapsed = time.time() - start
+    print(f"\nTraining done in {elapsed:.1f}s")
+
+    final_train = evaluate_on_set(model, X_train, Y_train, edge_index, device)
+    final_val = evaluate_on_set(model, X_val, Y_val, edge_index, device)
+    final_test = evaluate_on_set(model, X_test, Y_test, edge_index, device)
+
+    print(f"\n{'=' * 60}")
+    print(f"FINAL RESULTS ({args.adj_type}, {msg_config}, "
+          f"N={num_nodes}, n_train={effective_num_train}):")
+    print(f"  Train: MSE={final_train['mse']:.6f}, R2={final_train['r2']:.4f}")
+    print(f"  Val:   MSE={final_val['mse']:.6f}, R2={final_val['r2']:.4f}")
+    print(f"  Test:  MSE={final_test['mse']:.6f}, R2={final_test['r2']:.4f}")
+    print(f"{'=' * 60}")
+
+    results = {
+        "adj_type": args.adj_type,
+        "msg_config": msg_config,
+        "msg_description": msg_description,
+        "zscore": args.zscore,
+        "smooth": args.smooth,
+        "seed": args.seed,
+        "num_train_samples": effective_num_train,
+        "train_full_size": train_full_size,
+        "num_nodes": int(num_nodes),
+        "original_num_nodes": int(full_n),
+        "kept_node_indices": kept_node_indices.tolist(),
+        "dropped_node_indices": dropped_node_indices.tolist(),
+        "effective_batch": int(effective_batch),
+        "batch_ratio": float(args.batch_ratio) if args.batch_ratio is not None else None,
+        "best_val_loss": float(best_val_loss),
+        "epochs_trained": len(train_hist),
+        "elapsed_seconds": elapsed,
+        "train": {k: float(v) if isinstance(v, (float, np.floating)) else v
+                  for k, v in final_train.items() if k not in ("node_mse", "node_r2", "node_corr")},
+        "val": {k: float(v) if isinstance(v, (float, np.floating)) else v
+                for k, v in final_val.items() if k not in ("node_mse", "node_r2", "node_corr")},
+        "test": {k: float(v) if isinstance(v, (float, np.floating)) else v
+                 for k, v in final_test.items() if k not in ("node_mse", "node_r2", "node_corr")},
+    }
+    with open(os.path.join(args.outdir, "results.json"), "w") as f:
+        json.dump(results, f, indent=2, default=float)
+
+    metrics_df = pd.DataFrame(metrics_rows)
+    metrics_df.to_csv(os.path.join(args.outdir, "training_metrics.csv"), index=False)
+
+    with open(os.path.join(args.outdir, "loss_curves.pkl"), "wb") as f:
+        pickle.dump({"train": train_hist, "val": val_hist}, f)
+
+    node_r2_df = pd.DataFrame({
+        "county": county_names,
+        "kept_node_index": kept_node_indices,
+        "test_r2": final_test["node_r2"],
+        "test_corr": final_test["node_corr"],
+        "test_mse": final_test["node_mse"],
+    })
+    node_r2_df.to_csv(os.path.join(args.outdir, "test_per_node_metrics.csv"), index=False)
+
+    np.save(os.path.join(args.outdir, "X_features.npy"), X_feat)
+    np.save(os.path.join(args.outdir, "dXdt.npy"), dXdt)
+
+    print(f"Results saved to {args.outdir}")
+
+
+if __name__ == "__main__":
+    main()
