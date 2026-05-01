@@ -1,0 +1,125 @@
+#!/bin/bash
+# Data-limits sweep with REDUCED node count.
+#
+# Like ``run_datalimits_msg.sh``, but the graph is shrunk from
+# ${ORIGINAL_NUM_NODES} (chickenpox Hungary = 20 counties) down to
+# ${NUM_NODES_KEEP} nodes. The dropped node indices are chosen reproducibly
+# from --seed inside the python script, so different seeds drop different
+# nodes while a given seed always drops the same set.
+#
+# Output goes to ``runs_datalimits_msg_nodes${NUM_NODES_KEEP}/``.
+#
+# Distributes jobs across 4 GPUs (cuda:0-3), max 5 concurrent per GPU.
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+TRAIN_SCRIPT="${SCRIPT_DIR}/train_fixed_adj_ablation_msg_subnodes.py"
+
+# How many nodes to KEEP out of the original 20. Change this to sweep different
+# graph sizes; output dir is named accordingly so runs don't collide.
+NUM_NODES_KEEP=15
+
+BASE_OUTDIR="${SCRIPT_DIR}/runs_datalimits_msg_nodes${NUM_NODES_KEEP}"
+LOGDIR="${BASE_OUTDIR}/logs"
+mkdir -p "${LOGDIR}"
+
+GPUS=(0 1 2 3)
+MAX_PER_GPU=5
+
+SEEDS=($(seq 1 1 31))
+MSG_CONFIGS=(rate_x)
+ADJ_TYPES=(runs3thr0p6)
+ZSCORES=(false)
+
+# Training-data sizes to sweep. With 60/20/20 split on ~248 feature rows the
+# training set has ~148 rows; adjust if your series length changes.
+NUM_TRAIN_SAMPLES=($(seq 2 3 62))
+
+# Batch size as a fraction of the (subsampled) training set, so the number of
+# optimizer steps per epoch stays roughly constant across different
+# --num_train_samples.
+BATCH_RATIO=0.1
+
+declare -A gpu_count
+declare -A gpu_pids
+for g in "${GPUS[@]}"; do
+    gpu_count[$g]=0
+    gpu_pids[$g]=""
+done
+
+wait_for_slot() {
+    while true; do
+        for g in "${GPUS[@]}"; do
+            local cnt=0
+            for pid in ${gpu_pids[$g]}; do
+                if kill -0 "$pid" 2>/dev/null; then
+                    cnt=$((cnt + 1))
+                fi
+            done
+            gpu_count[$g]=$cnt
+            if [ "$cnt" -lt "$MAX_PER_GPU" ]; then
+                echo "$g"
+                return
+            fi
+        done
+        sleep 2
+    done
+}
+
+TOTAL=0
+SKIPPED=0
+
+for adj_type in "${ADJ_TYPES[@]}"; do
+    for msg in "${MSG_CONFIGS[@]}"; do
+        for zscore in "${ZSCORES[@]}"; do
+            if [ "$zscore" = "true" ]; then
+                zscore_tag="zscore"
+            else
+                zscore_tag="nozscore"
+            fi
+            for n_train in "${NUM_TRAIN_SAMPLES[@]}"; do
+                for seed in "${SEEDS[@]}"; do
+                    RUN_NAME="run${seed}_${adj_type}_${msg}_${zscore_tag}_gaussian_n${n_train}"
+                    OUTDIR="${BASE_OUTDIR}/${RUN_NAME}"
+
+                    if [ -f "${OUTDIR}/results.json" ]; then
+                        echo "SKIP: ${RUN_NAME}"
+                        SKIPPED=$((SKIPPED + 1))
+                        continue
+                    fi
+
+                    GPU_ID=$(wait_for_slot)
+                    TOTAL=$((TOTAL + 1))
+
+                    echo "[GPU ${GPU_ID}] #${TOTAL} START: ${RUN_NAME} (N=${NUM_NODES_KEEP})"
+                    python "${TRAIN_SCRIPT}" \
+                        --outdir "${OUTDIR}" \
+                        --adj_type "${adj_type}" \
+                        --msg_config "${msg}" \
+                        --zscore "${zscore}" \
+                        --smooth gaussian \
+                        --hidden 100 \
+                        --epochs 2000 \
+                        --batch_ratio "${BATCH_RATIO}" \
+                        --lr 1e-3 \
+                        --early_stop_patience 40 \
+                        --use_seed true \
+                        --seed "${seed}" \
+                        --device "cuda:${GPU_ID}" \
+                        --train_ratio 0.6 \
+                        --val_ratio 0.2 \
+                        --test_ratio 0.2 \
+                        --num_train_samples "${n_train}" \
+                        --num_nodes_keep "${NUM_NODES_KEEP}" \
+                        > "${LOGDIR}/${RUN_NAME}.log" 2>&1 &
+
+                    gpu_pids[$GPU_ID]="${gpu_pids[$GPU_ID]} $!"
+                done
+            done
+        done
+    done
+done
+
+echo ""
+echo "All ${TOTAL} jobs launched (${SKIPPED} skipped). Waiting for completion..."
+wait
+echo "All sub-nodes data-limits experiments completed (N=${NUM_NODES_KEEP})."

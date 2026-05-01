@@ -1,0 +1,2 @@
+adj_type,msg_config,r2_mean,r2_std,node_r2_mean,mse_mean,n_seeds
+runs3thr0p6,rate_x,0.6228468537330627,0.07200897501476161,0.21500760704278946,362.8460266113281,5
