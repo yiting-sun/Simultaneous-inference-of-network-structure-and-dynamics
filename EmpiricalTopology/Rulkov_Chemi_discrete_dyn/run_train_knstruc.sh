@@ -9,7 +9,7 @@
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 TRAIN_SCRIPT="${SCRIPT_DIR}/train_knstruc_RulkovChemical.py"
 
-BASE_OUTDIR="${SCRIPT_DIR}/results_knstruc"
+BASE_OUTDIR="${SCRIPT_DIR}/results_knstruc_gc0p05"
 LOGDIR="${BASE_OUTDIR}/logs"
 mkdir -p "${LOGDIR}"
 
@@ -24,17 +24,17 @@ max_per_gpu_for_N() {
 }
 
 DATA_SEED=1
-SEEDS=(1 2 3 4 5)
+SEEDS=(1 2 24 50 63)
 HIDDEN=50
 EPOCHS=2500
 BATCH_RATIO=0.05
 USE_EARLY_STOP=false
 DT_STR=0001
 DT_DATA=0.001
-TRAIN_T_START=20
-TRAIN_T_END=60
-EVAL_T_START=60
-EVAL_T_END=90
+TRAIN_T_START=10
+TRAIN_T_END=30
+EVAL_T_START=30
+EVAL_T_END=50
 LR=5e-4
 NUM_WORKERS=4
 
@@ -75,9 +75,9 @@ for spec in "${NODE_SPECS[@]}"; do
     MAX_PER_GPU=$(max_per_gpu_for_N "${N}")
 
     if [ "$N" -lt 80 ]; then
-        DATA_DIR="${SCRIPT_DIR}/data_small"
+        DATA_DIR="${SCRIPT_DIR}/data_small_gc0p05"
     else
-        DATA_DIR="${SCRIPT_DIR}/data_large"
+        DATA_DIR="${SCRIPT_DIR}/data_large_gc0p05"
     fi
 
     for n_train in "${TRAIN_SAMPLES[@]}"; do

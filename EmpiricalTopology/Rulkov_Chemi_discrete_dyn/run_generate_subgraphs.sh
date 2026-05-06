@@ -17,14 +17,14 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 GEN_SCRIPT="${SCRIPT_DIR}/generation_RulkovChemical.py"
 DXDT_SCRIPT="${SCRIPT_DIR}/compute_true_dxdt_RulkovChemical.py"
-DATA_SMALL="${SCRIPT_DIR}/data_small"
-DATA_LARGE="${SCRIPT_DIR}/data_large"
+DATA_SMALL="${SCRIPT_DIR}/data_small_gc0p05"
+DATA_LARGE="${SCRIPT_DIR}/data_large_gc0p05"
 ADJ_PATH="${SCRIPT_DIR}/data/ciona_cns_177_binary_adj.npy"
 
 # Simulation defaults
 T=100
 DT=0.001
-GC=0.1
+GC=0.05
 SYNAPSE_TYPE="excitatory"
 LAM=10.0
 THETA=-1.0
